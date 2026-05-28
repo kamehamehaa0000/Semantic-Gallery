@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package gallery;
+
+option go_package = "github.com/gallery/internal/proto/pb";
+
+service GalleryService {
+  // Index a list of images
+  rpc IndexImages(IndexRequest) returns (IndexResponse);
+  
+  // Search for images using a text query
+  rpc Search(SearchRequest) returns (SearchResponse);
+  
+  // Delete images from the index
+  rpc DeleteImages(DeleteRequest) returns (DeleteResponse);
+  
+  // Health check
+  rpc HealthCheck(Empty) returns (HealthResponse);
+}
+
+message Empty {}
+
+message IndexRequest {
+  repeated ImageEntry entries = 1;
+}
+
+message ImageEntry {
+  int64 id = 1;
+  string path = 2;
+}
+
+message IndexResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message SearchRequest {
+  string query = 1;
+  int32 limit = 2;
+}
+
+message SearchResponse {
+  repeated int64 ids = 1;
+  repeated float scores = 2;
+}
+
+message DeleteRequest {
+  repeated int64 ids = 1;
+}
+
+message DeleteResponse {
+  bool success = 1;
+}
+
+message HealthResponse {
+  bool healthy = 1;
+}
