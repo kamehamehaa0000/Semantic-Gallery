@@ -1,0 +1,8 @@
+grpcio
+grpcio-tools
+open_clip_torch
+torch
+torchvision
+faiss-cpu
+pillow
+numpy
