@@ -35,6 +35,14 @@ func (s *Service) GetCacheDir() string {
 	return s.cacheDir
 }
 
+func (s *Service) RemoveThumbnail(imagePath string) error {
+	thumbPath := s.GetThumbnailPath(imagePath)
+	if _, err := os.Stat(thumbPath); err == nil {
+		return os.Remove(thumbPath)
+	}
+	return nil
+}
+
 func (s *Service) EnsureThumbnail(imagePath string) (string, error) {
 	thumbPath := s.GetThumbnailPath(imagePath)
 	if _, err := os.Stat(thumbPath); err == nil {

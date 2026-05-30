@@ -13,9 +13,18 @@ import (
 )
 
 type ImageResult struct {
-	ID        int64  `json:"id"`
-	Path      string `json:"path"`
-	ThumbPath string `json:"thumb_path"`
+	ID           int64  `json:"id"`
+	Path         string `json:"path"`
+	Hash         string `json:"hash"`
+	FolderPath   string `json:"folder_path"`
+	Filename     string `json:"filename"`
+	Extension    string `json:"extension"`
+	FileSize     int64  `json:"file_size"`
+	Width        int    `json:"width"`
+	Height       int    `json:"height"`
+	CreatedAt    int64  `json:"created_at"`
+	LastModified int64  `json:"last_modified"`
+	ThumbPath    string `json:"thumb_path"`
 }
 
 // App struct
@@ -71,9 +80,18 @@ func (a *App) Search(query string, limit int) []ImageResult {
 	for _, img := range imgs {
 		thumb, _ := a.gallery.GetThumbnail(img.Path)
 		results = append(results, ImageResult{
-			ID:        img.ID,
-			Path:      img.Path,
-			ThumbPath: thumb,
+			ID:           img.ID,
+			Path:         img.Path,
+			Hash:         img.Hash,
+			FolderPath:   img.FolderPath,
+			Filename:     img.Filename,
+			Extension:    img.Extension,
+			FileSize:     img.FileSize,
+			Width:        img.Width,
+			Height:       img.Height,
+			CreatedAt:    img.CreatedAt,
+			LastModified: img.LastModified,
+			ThumbPath:    thumb,
 		})
 	}
 	return results
@@ -171,9 +189,18 @@ func (a *App) GetImages(limit int) []ImageResult {
 	for _, img := range imgs {
 		thumb, _ := a.gallery.GetThumbnail(img.Path)
 		results = append(results, ImageResult{
-			ID:        img.ID,
-			Path:      img.Path,
-			ThumbPath: thumb,
+			ID:           img.ID,
+			Path:         img.Path,
+			Hash:         img.Hash,
+			FolderPath:   img.FolderPath,
+			Filename:     img.Filename,
+			Extension:    img.Extension,
+			FileSize:     img.FileSize,
+			Width:        img.Width,
+			Height:       img.Height,
+			CreatedAt:    img.CreatedAt,
+			LastModified: img.LastModified,
+			ThumbPath:    thumb,
 		})
 	}
 	return results

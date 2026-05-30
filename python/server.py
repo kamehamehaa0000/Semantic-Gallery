@@ -103,12 +103,42 @@ class GalleryService(gallery_pb2_grpc.GalleryServiceServicer):
             return gallery_pb2.SearchResponse(ids=[], scores=[])
 
     def DeleteImages(self, request, context):
-        # FAISS IndexFlatIP doesn't support easy deletion by ID.
-        # For this prototype, we'll do a simple reconstruction if needed, 
-        # but for now let's just log it. A better production approach would be 
-        # using IndexIDMap or a more complex vector store.
-        logger.warning("DeleteImages not fully implemented in this prototype")
-        return gallery_pb2.DeleteResponse(success=False)
+        ids_to_remove = set(request.ids)
+        if not ids_to_remove:
+            return gallery_pb2.DeleteResponse(success=True)
+            
+        logger.info(f"Deleting {len(ids_to_remove)} images from index...")
+        
+        try:
+            # Reconstruct the index to remove entries
+            # 1. Get all vectors
+            if len(self.ids) == 0:
+                return gallery_pb2.DeleteResponse(success=True)
+                
+            all_vectors = faiss.rev_swig_ptr(self.index.get_xb(), self.index.ntotal * self.dim)
+            all_vectors = all_vectors.reshape(self.index.ntotal, self.dim)
+            
+            # 2. Identify indices to keep
+            keep_indices = [i for i, img_id in enumerate(self.ids) if img_id not in ids_to_remove]
+            
+            if len(keep_indices) == self.index.ntotal:
+                return gallery_pb2.DeleteResponse(success=True)
+                
+            # 3. Create new index and add kept vectors
+            new_index = faiss.IndexFlatIP(self.dim)
+            if keep_indices:
+                keep_vectors = all_vectors[keep_indices].copy().astype('float32')
+                new_index.add(keep_vectors)
+                
+            self.index = new_index
+            self.ids = [self.ids[i] for i in keep_indices]
+            
+            self.save_index()
+            logger.info(f"Deleted {len(ids_to_remove)} images. New total: {len(self.ids)}")
+            return gallery_pb2.DeleteResponse(success=True)
+        except Exception as e:
+            logger.error(f"DeleteImages failed: {e}")
+            return gallery_pb2.DeleteResponse(success=False)
 
     def HealthCheck(self, request, context):
         return gallery_pb2.HealthResponse(healthy=True)
