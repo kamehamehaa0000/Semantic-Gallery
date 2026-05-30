@@ -2,26 +2,35 @@ package db
 
 import (
 	"database/sql"
+	"encoding/binary"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
+	"sort"
 
 	_ "modernc.org/sqlite"
 )
 
 type Image struct {
-	ID           int64  `json:"id"`
-	Path         string `json:"path"`
-	Hash         string `json:"hash"`
-	FolderPath   string `json:"folder_path"`
-	Filename     string `json:"filename"`
-	Extension    string `json:"extension"`
-	FileSize     int64  `json:"file_size"`
-	Width        int    `json:"width"`
-	Height       int    `json:"height"`
-	CreatedAt    int64  `json:"created_at"`
-	LastModified int64  `json:"last_modified"`
+	ID           int64     `json:"id"`
+	Path         string    `json:"path"`
+	Hash         string    `json:"hash"`
+	FolderPath   string    `json:"folder_path"`
+	Filename     string    `json:"filename"`
+	Extension    string    `json:"extension"`
+	FileSize     int64     `json:"file_size"`
+	Width        int       `json:"width"`
+	Height       int       `json:"height"`
+	CreatedAt    int64     `json:"created_at"`
+	LastModified int64     `json:"last_modified"`
+	Embedding    []float32 `json:"-"` // Don't send to frontend by default
+}
+
+type VectorResult struct {
+	Image Image
+	Score float32
 }
 
 type Database struct {
@@ -69,13 +78,14 @@ func (db *Database) init() error {
 
 	// 2. Migration: Add missing columns if they don't exist
 	columnsToAdd := map[string]string{
-		"folder_path":   "TEXT",
-		"filename":      "TEXT",
-		"extension":     "TEXT",
-		"file_size":     "INTEGER",
-		"width":         "INTEGER",
-		"height":        "INTEGER",
-		"created_at":    "INTEGER",
+		"folder_path": "TEXT",
+		"filename":    "TEXT",
+		"extension":   "TEXT",
+		"file_size":   "INTEGER",
+		"width":       "INTEGER",
+		"height":      "INTEGER",
+		"created_at":  "INTEGER",
+		"embedding":   "BLOB",
 	}
 
 	for col, colType := range columnsToAdd {
@@ -126,13 +136,22 @@ func (db *Database) columnExists(table, column string) bool {
 }
 
 func (db *Database) AddImage(img Image) (int64, error) {
+	// Convert embedding to bytes
+	var embBlob []byte
+	if len(img.Embedding) > 0 {
+		embBlob = make([]byte, len(img.Embedding)*4)
+		for i, f := range img.Embedding {
+			binary.LittleEndian.PutUint32(embBlob[i*4:], math.Float32bits(f))
+		}
+	}
+
 	res, err := db.conn.Exec(`
 		INSERT OR REPLACE INTO images (
 			path, hash, folder_path, filename, extension, 
-			file_size, width, height, created_at, last_modified
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			file_size, width, height, created_at, last_modified, embedding
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		img.Path, img.Hash, img.FolderPath, img.Filename, img.Extension,
-		img.FileSize, img.Width, img.Height, img.CreatedAt, img.LastModified,
+		img.FileSize, img.Width, img.Height, img.CreatedAt, img.LastModified, embBlob,
 	)
 	if err != nil {
 		return 0, err
@@ -142,32 +161,46 @@ func (db *Database) AddImage(img Image) (int64, error) {
 
 func (db *Database) GetImageByPath(path string) (*Image, error) {
 	var img Image
+	var embBlob []byte
 	err := db.conn.QueryRow(`
 		SELECT id, path, hash, 
 		       COALESCE(folder_path, ''), COALESCE(filename, ''), COALESCE(extension, ''), 
 		       COALESCE(file_size, 0), COALESCE(width, 0), COALESCE(height, 0), 
-		       COALESCE(created_at, 0), COALESCE(last_modified, 0) 
+		       COALESCE(created_at, 0), COALESCE(last_modified, 0), embedding 
 		FROM images WHERE path = ?`, path).
 		Scan(&img.ID, &img.Path, &img.Hash, &img.FolderPath, &img.Filename, &img.Extension,
-			&img.FileSize, &img.Width, &img.Height, &img.CreatedAt, &img.LastModified)
+			&img.FileSize, &img.Width, &img.Height, &img.CreatedAt, &img.LastModified, &embBlob)
 	if err != nil {
 		return nil, err
+	}
+	if len(embBlob) >= 4 {
+		img.Embedding = make([]float32, len(embBlob)/4)
+		for i := range img.Embedding {
+			img.Embedding[i] = math.Float32frombits(binary.LittleEndian.Uint32(embBlob[i*4:]))
+		}
 	}
 	return &img, nil
 }
 
 func (db *Database) GetImageByHash(hash string) (*Image, error) {
 	var img Image
+	var embBlob []byte
 	err := db.conn.QueryRow(`
 		SELECT id, path, hash, 
 		       COALESCE(folder_path, ''), COALESCE(filename, ''), COALESCE(extension, ''), 
 		       COALESCE(file_size, 0), COALESCE(width, 0), COALESCE(height, 0), 
-		       COALESCE(created_at, 0), COALESCE(last_modified, 0) 
+		       COALESCE(created_at, 0), COALESCE(last_modified, 0), embedding 
 		FROM images WHERE hash = ? LIMIT 1`, hash).
 		Scan(&img.ID, &img.Path, &img.Hash, &img.FolderPath, &img.Filename, &img.Extension,
-			&img.FileSize, &img.Width, &img.Height, &img.CreatedAt, &img.LastModified)
+			&img.FileSize, &img.Width, &img.Height, &img.CreatedAt, &img.LastModified, &embBlob)
 	if err != nil {
 		return nil, err
+	}
+	if len(embBlob) >= 4 {
+		img.Embedding = make([]float32, len(embBlob)/4)
+		for i := range img.Embedding {
+			img.Embedding[i] = math.Float32frombits(binary.LittleEndian.Uint32(embBlob[i*4:]))
+		}
 	}
 	return &img, nil
 }
@@ -240,6 +273,55 @@ func (db *Database) GetAllImages(limit int) ([]Image, error) {
 	return images, nil
 }
 
+func (db *Database) SearchVectors(queryVector []float32, limit int) ([]VectorResult, error) {
+	rows, err := db.conn.Query(`
+		SELECT id, path, hash, 
+		       COALESCE(folder_path, ''), COALESCE(filename, ''), COALESCE(extension, ''), 
+		       COALESCE(file_size, 0), COALESCE(width, 0), COALESCE(height, 0), 
+		       COALESCE(created_at, 0), COALESCE(last_modified, 0), embedding 
+		FROM images WHERE embedding IS NOT NULL`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []VectorResult
+	for rows.Next() {
+		var img Image
+		var embBlob []byte
+		if err := rows.Scan(&img.ID, &img.Path, &img.Hash, &img.FolderPath, &img.Filename, &img.Extension,
+			&img.FileSize, &img.Width, &img.Height, &img.CreatedAt, &img.LastModified, &embBlob); err != nil {
+			return nil, err
+		}
+
+		// Decode embedding
+		if len(embBlob) >= 4 {
+			img.Embedding = make([]float32, len(embBlob)/4)
+			for i := range img.Embedding {
+				img.Embedding[i] = math.Float32frombits(binary.LittleEndian.Uint32(embBlob[i*4:]))
+			}
+
+			// Calculate Cosine Similarity (Dot product since vectors are normalized)
+			var score float32
+			for i := 0; i < len(queryVector) && i < len(img.Embedding); i++ {
+				score += queryVector[i] * img.Embedding[i]
+			}
+			results = append(results, VectorResult{Image: img, Score: score})
+		}
+	}
+
+	// Sort by score descending
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Score > results[j].Score
+	})
+
+	if len(results) > limit {
+		results = results[:limit]
+	}
+
+	return results, nil
+}
+
 func (db *Database) AddWatchedFolder(path string) error {
 	_, err := db.conn.Exec("INSERT OR IGNORE INTO watched_folders (path) VALUES (?)", path)
 	return err
@@ -255,7 +337,6 @@ func (db *Database) DeletePath(path string) ([]int64, []string, error) {
 	path = filepath.Clean(path)
 	
 	// Get IDs and Paths before deleting
-	// We match the exact path OR paths that start with (path + separator)
 	sep := string(os.PathSeparator)
 	altSep := "/"
 	if sep == "/" {
@@ -287,7 +368,6 @@ func (db *Database) DeletePath(path string) ([]int64, []string, error) {
 		paths = append(paths, p)
 	}
 
-	// Delete from images table using the same logic
 	_, err = db.conn.Exec(`
 		DELETE FROM images 
 		WHERE path = ? 

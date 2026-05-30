@@ -38,24 +38,41 @@ func NewApp() *App {
 	return &App{}
 }
 
-// startup is called when the app starts. The context is saved
-// so we can call the runtime methods
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	
+	// Determine base data directory
 	userHome, _ := os.UserHomeDir()
 	dataDir := filepath.Join(userHome, ".local-semantic-gallery")
 	
-	gs, err := service.NewGalleryService(dataDir, "localhost:50051")
+	// If project-local data folder exists, use it (easier for development)
+	if _, err := os.Stat("data"); err == nil {
+		dataDir, _ = filepath.Abs("data")
+	} else {
+		// Ensure home directory exists
+		os.MkdirAll(dataDir, 0755)
+		// We might need to copy models here if they don't exist, 
+		// but for now let's assume 'data' folder is preferred.
+	}
+	
+	// Determine ORT library path
+	execPath, _ := os.Executable()
+	execDir := filepath.Dir(execPath)
+	ortPath := "onnxruntime.dll"
+	if _, err := os.Stat(ortPath); os.IsNotExist(err) {
+		ortPath = filepath.Join(execDir, "onnxruntime.dll")
+	}
+	ortPath, _ = filepath.Abs(ortPath)
+
+	gs, err := service.NewGalleryService(dataDir, ortPath)
+
 	if err != nil {
 		fmt.Printf("FATAL: Error starting gallery service: %v\n", err)
-		fmt.Printf("Make sure the Python gRPC server is running on localhost:50051\n")
-		fmt.Printf("Run: cd python && python server.py\n")
 		return
 	}
 	gs.SetContext(ctx)
 	a.gallery = gs
-	fmt.Printf("Gallery service started successfully\n")
+	fmt.Printf("Gallery service started successfully with native ML (Data: %s)\n", dataDir)
 }
 
 // shutdown is called when the app is closing

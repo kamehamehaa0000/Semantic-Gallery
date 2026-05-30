@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"fmt"
 	"image"
 	_ "image/gif"
 	_ "image/jpeg"
@@ -19,18 +20,16 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/rwcarlsen/goexif/exif"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/gallery/internal/db"
-	"github.com/gallery/internal/proto/pb"
+	"github.com/gallery/internal/ml"
 	"github.com/gallery/internal/thumbnail"
 )
 
 type GalleryService struct {
 	db             *db.Database
 	thumbs         *thumbnail.Service
-	grpcClient     pb.GalleryServiceClient
+	ml             *ml.Service
 	watcher        *fsnotify.Watcher
 	indexingCh     chan string
 	ctx            context.Context
@@ -41,7 +40,7 @@ type GalleryService struct {
 	mu             sync.Mutex
 }
 
-func NewGalleryService(dataDir string, grpcAddr string) (*GalleryService, error) {
+func NewGalleryService(dataDir string, ortLibPath string) (*GalleryService, error) {
 	database, err := db.NewDatabase(dataDir)
 	if err != nil {
 		return nil, err
@@ -52,20 +51,10 @@ func NewGalleryService(dataDir string, grpcAddr string) (*GalleryService, error)
 		return nil, err
 	}
 
-	// Dial with a context and timeout
-	dialCtx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer dialCancel()
-	
-	conn, err := grpc.DialContext(dialCtx, grpcAddr, 
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock()) // Wait for connection to be ready
+	mlService, err := ml.NewService(dataDir, ortLibPath)
 	if err != nil {
-		// If it fails, we still want the app to start, so we'll dial in background
-		log.Printf("Warning: Initial gRPC connection failed: %v. Will retry in background.", err)
-		conn, _ = grpc.Dial(grpcAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		log.Printf("Warning: Failed to initialize native ML service: %v. Semantic search will be disabled.", err)
 	}
-	
-	client := pb.NewGalleryServiceClient(conn)
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -77,7 +66,7 @@ func NewGalleryService(dataDir string, grpcAddr string) (*GalleryService, error)
 	gs := &GalleryService{
 		db:             database,
 		thumbs:         thumbs,
-		grpcClient:     client,
+		ml:             mlService,
 		watcher:        watcher,
 		indexingCh:     make(chan string, 1000),
 		ctx:            ctx,
@@ -109,15 +98,12 @@ func (s *GalleryService) Reconcile() {
 	}
 
 	// 2. Clean up orphaned entries (files that were deleted while app was closed)
-	// We'll do this in chunks to avoid locking the DB for too long
 	s.cleanupOrphanedEntries()
 	
 	log.Println("Reconciliation complete.")
 }
 
 func (s *GalleryService) cleanupOrphanedEntries() {
-	// Simple approach: Get all paths from DB and check existence
-	// In a massive gallery, we'd do this more efficiently with sub-queries
 	imgs, err := s.db.GetAllImages(1000000) // Get all
 	if err != nil {
 		return
@@ -171,7 +157,6 @@ func (s *GalleryService) processBatch(paths []string) {
 		runtime.EventsEmit(s.wailsCtx, "indexing_start", len(paths))
 	}
 
-	entries := make([]*pb.ImageEntry, 0, len(paths))
 	for _, path := range paths {
 		info, err := os.Stat(path)
 		if err != nil {
@@ -180,40 +165,29 @@ func (s *GalleryService) processBatch(paths []string) {
 
 		hash, _ := computeHash(path)
 		
-		// Move/Rename detection: Check if we already have this hash
-		existing, _ := s.db.GetImageByHash(hash)
-		if existing != nil && existing.Path != path {
-			log.Printf("Rename/Move detected: %s -> %s", existing.Path, path)
-			// We can delete the old path from the index if we want, but usually 
-			// the watcher will have already triggered a deletion for the old path.
-			// The important part is that we reuse the metadata if possible, 
-			// or just overwrite with new path.
+		meta := s.extractMetadata(path, info, hash)
+		
+		// Generate embedding locally
+		if s.ml != nil {
+			emb, err := s.ml.GetImageEmbedding(path)
+			if err != nil {
+				log.Printf("ML error for %s: %v", path, err)
+			} else {
+				meta.Embedding = emb
+			}
 		}
 
-		meta := s.extractMetadata(path, info, hash)
-		id, err := s.db.AddImage(meta)
+		_, err = s.db.AddImage(meta)
 		if err != nil {
 			log.Printf("DB error for %s: %v", path, err)
 			continue
 		}
-
-		entries = append(entries, &pb.ImageEntry{
-			Id:   id,
-			Path: path,
-		})
 
 		// Pre-generate thumbnail
 		s.thumbs.EnsureThumbnail(path)
 
 		if s.wailsCtx != nil {
 			runtime.EventsEmit(s.wailsCtx, "indexing_progress", path)
-		}
-	}
-
-	if len(entries) > 0 {
-		_, err := s.grpcClient.IndexImages(s.ctx, &pb.IndexRequest{Entries: entries})
-		if err != nil {
-			log.Printf("gRPC Index error: %v", err)
 		}
 	}
 
@@ -273,6 +247,7 @@ func computeHash(path string) (string, error) {
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
+
 func (s *GalleryService) startWatcher() {
 	s.wg.Add(1)
 	go func() {
@@ -286,15 +261,12 @@ func (s *GalleryService) startWatcher() {
 
 				log.Printf("Watcher: %s on %s", event.Op, event.Name)
 
-				// Handle removals/moves-out
 				if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
-					// Check if it really doesn't exist anymore
 					_, err := os.Stat(event.Name)
 					if os.IsNotExist(err) {
 						log.Printf("Watcher: File/Dir removed or moved out: %s", event.Name)
 						s.handleDeletion(event.Name)
 
-						// Check if it was a root watched folder
 						folders, _ := s.db.GetWatchedFolders()
 						for _, f := range folders {
 							if f == event.Name {
@@ -309,7 +281,6 @@ func (s *GalleryService) startWatcher() {
 					}
 				}
 
-				// Handle new files and directories or updates
 				if event.Op&(fsnotify.Create|fsnotify.Rename|fsnotify.Write) != 0 {
 					info, err := os.Stat(event.Name)
 					if err == nil {
@@ -337,7 +308,6 @@ func (s *GalleryService) startWatcher() {
 		}
 	}()
 
-	// Load existing watched folders
 	folders, _ := s.db.GetWatchedFolders()
 	for _, f := range folders {
 		s.addWatch(f)
@@ -357,8 +327,6 @@ func (s *GalleryService) removeWatch(path string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	
-	// Remove from watcher and map
-	// We also need to remove all subdirectories from the map and watcher
 	sep := string(os.PathSeparator)
 	for p := range s.watchedFolders {
 		if p == path || strings.HasPrefix(p, path+sep) || (sep == "\\" && strings.HasPrefix(p, strings.ReplaceAll(path, "\\", "/")+ "/")) {
@@ -369,21 +337,12 @@ func (s *GalleryService) removeWatch(path string) {
 }
 
 func (s *GalleryService) handleDeletion(path string) {
-	ids, paths, err := s.db.DeletePath(path)
+	_, paths, err := s.db.DeletePath(path)
 	if err != nil {
 		log.Printf("Error deleting path %s from DB: %v", path, err)
 		return
 	}
 
-	// Remove from gRPC index
-	if len(ids) > 0 {
-		_, err := s.grpcClient.DeleteImages(s.ctx, &pb.DeleteRequest{Ids: ids})
-		if err != nil {
-			log.Printf("gRPC Delete error: %v", err)
-		}
-	}
-
-	// Remove thumbnails
 	for _, p := range paths {
 		s.thumbs.RemoveThumbnail(p)
 	}
@@ -392,7 +351,6 @@ func (s *GalleryService) handleDeletion(path string) {
 		runtime.EventsEmit(s.wailsCtx, "images_updated")
 	}
 
-	// Clean up watches recursively
 	s.removeWatch(path)
 }
 
@@ -406,10 +364,7 @@ func (s *GalleryService) AddFolder(path string) error {
 		return err
 	}
 	s.addWatch(path)
-
-	// Initial scan
 	go s.ScanFolder(path)
-
 	return nil
 }
 
@@ -417,9 +372,7 @@ func (s *GalleryService) RemoveFolder(path string) error {
 	if err := s.db.RemoveWatchedFolder(path); err != nil {
 		return err
 	}
-	// Also delete images belonging to this folder from DB and gRPC
 	s.handleDeletion(path)
-	
 	return nil
 }
 
@@ -431,7 +384,6 @@ func (s *GalleryService) ScanFolder(path string) {
 		if !info.IsDir() && isImage(p) {
 			s.indexingCh <- p
 		} else if info.IsDir() && p != path {
-			// Add subfolders to watcher too
 			s.addWatch(p)
 		}
 		return nil
@@ -439,15 +391,25 @@ func (s *GalleryService) ScanFolder(path string) {
 }
 
 func (s *GalleryService) Search(query string, limit int) ([]db.Image, error) {
-	resp, err := s.grpcClient.Search(s.ctx, &pb.SearchRequest{
-		Query: query,
-		Limit: int32(limit),
-	})
+	if s.ml == nil {
+		return nil, fmt.Errorf("ML service not available")
+	}
+
+	queryEmb, err := s.ml.GetTextEmbedding(query)
 	if err != nil {
 		return nil, err
 	}
 
-	return s.db.GetImagesByIDs(resp.Ids)
+	results, err := s.db.SearchVectors(queryEmb, limit)
+	if err != nil {
+		return nil, err
+	}
+
+	imgs := make([]db.Image, 0, len(results))
+	for _, res := range results {
+		imgs = append(imgs, res.Image)
+	}
+	return imgs, nil
 }
 
 func (s *GalleryService) GetWatchedFolders() ([]string, error) {
@@ -459,28 +421,20 @@ func (s *GalleryService) GetAllImages(limit int) ([]db.Image, error) {
 }
 
 func (s *GalleryService) ClearAllData() error {
-	// Clear DB
 	if err := s.db.ClearAllData(); err != nil {
 		return err
 	}
-	
-	// Clear thumbnails
 	thumbs, _ := filepath.Glob(filepath.Join(s.thumbs.GetCacheDir(), "*"))
 	for _, f := range thumbs {
 		os.Remove(f)
 	}
-	
-	// Reset watcher
 	s.watcher.Close()
-	
 	s.mu.Lock()
 	s.watchedFolders = make(map[string]bool)
 	s.mu.Unlock()
-
 	w, _ := fsnotify.NewWatcher()
 	s.watcher = w
 	s.startWatcher()
-	
 	return nil
 }
 
@@ -492,5 +446,8 @@ func (s *GalleryService) Close() {
 	s.cancel()
 	s.wg.Wait()
 	s.db.Close()
+	if s.ml != nil {
+		s.ml.Close()
+	}
 	s.watcher.Close()
 }

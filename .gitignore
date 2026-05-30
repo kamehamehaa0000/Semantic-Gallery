@@ -2,6 +2,7 @@ build
 build/bin
 node_modules
 frontend/dist
+thumbnails
 __pycache__
 .exe
 .pyc
