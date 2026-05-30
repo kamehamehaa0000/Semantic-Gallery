@@ -8,3 +8,4 @@ __pycache__
 .pyc
 *.exe
 gallery.exe
+gallery.db

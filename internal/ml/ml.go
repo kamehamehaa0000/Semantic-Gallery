@@ -148,9 +148,9 @@ func (s *Service) loadImage(path string) (image.Image, error) {
 }
 
 func (s *Service) preprocessImage(img image.Image) []float32 {
-	// 1. Resize to 224x224
+	// 1. Resize to 224x224 using Bicubic (CatmullRom)
 	resized := image.NewRGBA(image.Rect(0, 0, 224, 224))
-	draw.BiLinear.Scale(resized, resized.Bounds(), img, img.Bounds(), draw.Over, nil)
+	draw.CatmullRom.Scale(resized, resized.Bounds(), img, img.Bounds(), draw.Over, nil)
 
 	// 2. Normalize
 	// CLIP normalization: mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]
@@ -160,11 +160,11 @@ func (s *Service) preprocessImage(img image.Image) []float32 {
 	data := make([]float32, 3*224*224)
 	for y := 0; y < 224; y++ {
 		for x := 0; x < 224; x++ {
-			r, g, b, _ := resized.At(x, y).RGBA()
-			// RGBA returns values in [0, 65535]
-			fr := float32(r) / 65535.0
-			fg := float32(g) / 65535.0
-			fb := float32(b) / 65535.0
+			// Direct pixel access to avoid premultiplied alpha issues and for better performance
+			pixIdx := resized.PixOffset(x, y)
+			fr := float32(resized.Pix[pixIdx]) / 255.0
+			fg := float32(resized.Pix[pixIdx+1]) / 255.0
+			fb := float32(resized.Pix[pixIdx+2]) / 255.0
 
 			// NCHW format
 			data[0*224*224 + y*224 + x] = (fr - mean[0]) / std[0]
@@ -176,30 +176,71 @@ func (s *Service) preprocessImage(img image.Image) []float32 {
 }
 
 func (s *Service) tokenize(text string) []int64 {
-	// Very basic CLIP Tokenizer implementation
-	// Real implementation needs BPE. For now, we'll do simple word splitting
-	// to get the app running, but we should improve this.
-	// CLIP start token: 49406, end token: 49407
+	// Improved CLIP Tokenizer implementation
+	// Note: For full accuracy, a proper BPE implementation is required.
+	// This version handles basic punctuation splitting and subword matching.
+	text = strings.ToLower(text)
 	
-	words := strings.Fields(strings.ToLower(text))
+	// Basic cleanup and splitting by punctuation/spaces
+	var words []string
+	var current strings.Builder
+	for _, r := range text {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			current.WriteRune(r)
+		} else {
+			if current.Len() > 0 {
+				words = append(words, current.String())
+				current.Reset()
+			}
+			if r != ' ' {
+				words = append(words, string(r))
+			}
+		}
+	}
+	if current.Len() > 0 {
+		words = append(words, current.String())
+	}
+
 	tokens := make([]int64, 77)
-	tokens[0] = 49406
+	tokens[0] = 49406 // <start_of_text>
 	
 	curr := 1
 	for _, word := range words {
-		if id, ok := s.vocab[word]; ok {
-			tokens[curr] = int64(id)
-			curr++
-		} else if id, ok := s.vocab[word + "</w>"]; ok {
-			tokens[curr] = int64(id)
-			curr++
-		}
 		if curr >= 76 {
 			break
 		}
+		
+		// 1. Try word + </w> (standard CLIP BPE for end of word)
+		if id, ok := s.vocab[word+"</w>"]; ok {
+			tokens[curr] = int64(id)
+			curr++
+			continue
+		}
+		
+		// 2. Try word as is
+		if id, ok := s.vocab[word]; ok {
+			tokens[curr] = int64(id)
+			curr++
+			continue
+		}
+		
+		// 3. Fallback: split into characters (crude BPE approximation)
+		for _, r := range word {
+			if curr >= 76 {
+				break
+			}
+			char := string(r)
+			if id, ok := s.vocab[char+"</w>"]; ok {
+				tokens[curr] = int64(id)
+				curr++
+			} else if id, ok := s.vocab[char]; ok {
+				tokens[curr] = int64(id)
+				curr++
+			}
+		}
 	}
 	
-	tokens[curr] = 49407
+	tokens[curr] = 49407 // <end_of_text>
 	return tokens
 }
 
