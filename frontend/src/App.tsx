@@ -6,6 +6,15 @@ import {EventsOn} from "../wailsjs/runtime";
 interface ImageResult {
     id: number;
     path: string;
+    hash: string;
+    folder_path: string;
+    filename: string;
+    extension: string;
+    file_size: number;
+    width: number;
+    height: number;
+    created_at: number;
+    last_modified: number;
     thumb_path: string;
 }
 
@@ -60,6 +69,14 @@ function App() {
         EventsOn("indexing_end", () => {
             setIndexing({ active: false, total: 0, current: 0 });
             loadInitialImages();
+        });
+        EventsOn("images_updated", () => {
+            console.log("Images updated event received, refreshing...");
+            loadInitialImages();
+        });
+        EventsOn("folders_updated", () => {
+            console.log("Folders updated event received, refreshing...");
+            loadFolders();
         });
     };
 
